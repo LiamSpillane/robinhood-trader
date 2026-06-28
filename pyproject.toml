@@ -1,0 +1,12 @@
+[project]
+name = "robinhood-trader"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "apscheduler>=3.10,<4.0",
+    "mcp[cli]>=1.8",
+    "ollama>=0.4",
+    "pydantic-settings>=2.3",
+]
