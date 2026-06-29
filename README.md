@@ -82,6 +82,7 @@ robinhood-trader/
 │   └── runner.py            # Triage and quant cycle orchestration
 ├── strategy/
 │   ├── news.py              # NewsSource abstraction (Finnhub implementation)
+│   ├── position_tracker.py  # Profit/Loss and stop loss tracking
 │   ├── triage_cache.py      # In-memory cache of triage results
 │   └── triage.py            # LLM sentiment assessment
 ├── .env                     # Environment settings
