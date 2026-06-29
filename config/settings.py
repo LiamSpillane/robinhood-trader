@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     strategy_oversold_threshold: float = -0.05
     strategy_exit_threshold: float = 0.01
     max_position_size_usd: float = 200.0
+    trailing_stop_cushion_pct: float = 5.0
 
     # Scheduler
     triage_interval_minutes: int = 60

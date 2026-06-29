@@ -11,5 +11,6 @@ wheels/
 
 .env
 .tokens/
+.positions/
 logs/
 uv.lock

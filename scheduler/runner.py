@@ -8,16 +8,18 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from broker.mcp_client import (
+    call_tool,
     get_portfolio,
     compute_signals,
     robinhood_session,
+    get_position_shares,
     safe_place_equity_order,
 )
 from config.settings import get_settings
-from broker.mcp_client import get_position_shares
 from strategy.news import FinnhubNewsSource
 from strategy.triage import run_triage
 from strategy.triage_cache import TriageCache, triage_cache
+from strategy.position_tracker import position_tracker
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +59,61 @@ async def run_quant_cycle(cache: TriageCache) -> None:
     try:
         async with robinhood_session() as session:
 
+            stopped_out_this_cycle: set[str] = set()
+
+            for symbol in position_tracker.all_symbols():
+                try:
+                    quote_data = json.loads(
+                        await call_tool(
+                            session, "get_equity_quotes", {"symbols": [symbol]}
+                        )
+                    )
+                    current_price = float(
+                        quote_data["data"]["results"][0]["quote"]["last_trade_price"]
+                    )
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    log.warning(
+                        "Could not fetch price for %s during stop loss check", symbol
+                    )
+                    continue
+
+                position_tracker.update_peak(symbol, current_price)
+
+                if position_tracker.should_stop(
+                    symbol, current_price, settings.trailing_stop_cushion_pct
+                ):
+                    position = position_tracker.get(symbol)
+                    shares_to_sell = await get_position_shares(
+                        session, symbol, settings.robinhood_account_number
+                    )
+                    if shares_to_sell > 0:
+                        result = json.loads(
+                            await safe_place_equity_order(
+                                session,
+                                {
+                                    "symbol": symbol,
+                                    "side": "sell",
+                                    "type": "market",
+                                    "quantity": str(shares_to_sell),
+                                    "account_number": settings.robinhood_account_number,
+                                },
+                                settings.max_position_size_usd,
+                            )
+                        )
+                        if "error" in result:
+                            order_log.append(
+                                f"  {symbol}: STOP LOSS FAILED - {result['error']}"
+                            )
+                        else:
+                            position_tracker.record_sell(
+                                symbol, current_price, shares_to_sell, "trailing_stop"
+                            )
+                            stopped_out_this_cycle.add(symbol)
+                            order_log.append(
+                                f"  {symbol}: STOP LOSS SELL {shares_to_sell} shares"
+                                f" @ ${current_price:.2f} (peak {position["peak_gain_pct"]:.2f}%)"
+                            )
+
             # Split tickers by sentiment
             bullish = [r.symbol for r in cache.get_all() if r.direction == "bullish"]
             bearish = [r.symbol for r in cache.get_all() if r.direction == "bearish"]
@@ -72,15 +129,20 @@ async def run_quant_cycle(cache: TriageCache) -> None:
                 )
                 signals = json.loads(signals_raw)["signals"]
 
-                for signal in signals:
-                    if signal.get("qualifies"):
+                for trade_signal in signals:
+                    if trade_signal.get("qualifies"):
                         existing_shares = await get_position_shares(
-                            session, signal["symbol"], settings.robinhood_account_number
+                            session,
+                            trade_signal["symbol"],
+                            settings.robinhood_account_number,
                         )
                         if existing_shares > 0:
                             order_log.append(
-                                f"  {signal["symbol"]}: ALREADY HOLDING {existing_shares} shares - skipping"
+                                f"  {trade_signal["symbol"]}: ALREADY HOLDING {existing_shares} shares - skipping"
                             )
+                            continue
+
+                        if trade_signal["symbol"] in stopped_out_this_cycle:
                             continue
 
                         portfolio = json.loads(
@@ -92,7 +154,7 @@ async def run_quant_cycle(cache: TriageCache) -> None:
                             portfolio["data"]["buying_power"]["buying_power"]
                         )
 
-                        price = signal["price"]
+                        price = trade_signal["price"]
                         effective_limit = min(
                             buying_power, settings.max_position_size_usd
                         )
@@ -100,7 +162,7 @@ async def run_quant_cycle(cache: TriageCache) -> None:
 
                         if quantity <= 0:
                             order_log.append(
-                                f"  {signal["symbol"]}: SKIPPED - insufficient buying power (${buying_power:.2f})"
+                                f"  {trade_signal["symbol"]}: SKIPPED - insufficient buying power (${buying_power:.2f})"
                             )
                             continue
 
@@ -108,7 +170,7 @@ async def run_quant_cycle(cache: TriageCache) -> None:
                             await safe_place_equity_order(
                                 session,
                                 {
-                                    "symbol": signal["symbol"],
+                                    "symbol": trade_signal["symbol"],
                                     "side": "buy",
                                     "type": "market",
                                     "quantity": str(quantity),
@@ -119,16 +181,19 @@ async def run_quant_cycle(cache: TriageCache) -> None:
                         )
                         if "error" in result:
                             order_log.append(
-                                f"  {signal["symbol"]}: SKIPPED - {result["error"]}"
+                                f"  {trade_signal["symbol"]}: SKIPPED - {result["error"]}"
                             )
                         else:
+                            position_tracker.record_buy(
+                                trade_signal["symbol"], price, quantity
+                            )
                             order_log.append(
-                                f"  {signal["symbol"]}: BUY {quantity} shares"
-                                f" @ ~${signal["price"]:.2f} (deviation {signal["deviation_pct"]}%)"
+                                f"  {trade_signal["symbol"]}: BUY {quantity} shares"
+                                f" @ ~${trade_signal["price"]:.2f} (deviation {trade_signal["deviation_pct"]}%)"
                             )
                     else:
                         order_log.append(
-                            f"  {signal["symbol"]}: NO SIGNAL (deviation {signal["deviation_pct"]}%)"
+                            f"  {trade_signal["symbol"]}: NO SIGNAL (deviation {trade_signal["deviation_pct"]}%)"
                         )
 
             # Exit signals - bearish tickers where we hold a position
@@ -140,24 +205,23 @@ async def run_quant_cycle(cache: TriageCache) -> None:
                 )
                 exit_signals = json.loads(exit_signals_raw)["signals"]
 
-                for signal in exit_signals:
-                    deviation = signal.get("deviation_pct", 0)
+                for trade_signal in exit_signals:
+                    shares_to_sell = await get_position_shares(
+                        session,
+                        trade_signal["symbol"],
+                        settings.robinhood_account_number,
+                    )
+
+                    if shares_to_sell == 0:
+                        continue
+
+                    deviation = trade_signal.get("deviation_pct", 0)
                     if deviation >= settings.strategy_exit_threshold * 100:
-                        shares_to_sell = await get_position_shares(
-                            session, signal["symbol"], settings.robinhood_account_number
-                        )
-
-                        if shares_to_sell == 0:
-                            order_log.append(
-                                f"  {signal["symbol"]}: NO POSITION TO SELL"
-                            )
-                            continue
-
                         result = json.loads(
                             await safe_place_equity_order(
                                 session,
                                 {
-                                    "symbol": signal["symbol"],
+                                    "symbol": trade_signal["symbol"],
                                     "side": "sell",
                                     "type": "market",
                                     "quantity": str(shares_to_sell),
@@ -168,16 +232,22 @@ async def run_quant_cycle(cache: TriageCache) -> None:
                         )
                         if "error" in result:
                             order_log.append(
-                                f"  {signal["symbol"]}: SKIPPED - {result["error"]}"
+                                f"  {trade_signal["symbol"]}: SKIPPED - {result["error"]}"
                             )
                         else:
+                            position_tracker.record_sell(
+                                trade_signal["symbol"],
+                                trade_signal["price"],
+                                shares_to_sell,
+                                "sentiment_exit",
+                            )
                             order_log.append(
-                                f"  {signal["symbol"]}: SELL {shares_to_sell} shares"
-                                f"@ ~${signal["price"]:.2f} (deviation {deviation}%)"
+                                f"  {trade_signal["symbol"]}: SELL {shares_to_sell} shares"
+                                f"@ ~${trade_signal["price"]:.2f} (deviation {deviation}%)"
                             )
                     else:
                         order_log.append(
-                            f"  {signal["symbol"]}: NO EXIT SIGNAL (deviation {deviation}%)"
+                            f"  {trade_signal["symbol"]}: NO EXIT SIGNAL (deviation {deviation}%)"
                         )
 
     except RuntimeError as exc:
@@ -229,7 +299,7 @@ def run_scheduler() -> None:
     )
 
     def _shutdown(sig_name: str) -> None:
-        log.info("Recieved %s - shutting down.", sig_name)
+        log.info("Received %s - shutting down.", sig_name)
         scheduler.shutdown(wait=False)
         loop.stop()
 

@@ -102,6 +102,7 @@ robinhood-trader/
 | `STRATEGY_OVERSOLD_THRESHOLD` | `-0.05` | SMA deviation to trigger a buy (-5%) |
 | `STRATEGY_EXIT_THRESHOLD` | `0.01` | SMA deviation to trigger a sell (+1%) |
 | `MAX_POSITION_SIZE_USD` | `200.0` | Max USD per order |
+| `TRAILING_STOP_CUSHION_PCT` | `5.0` | How far behind to set the stop loss |
 | `TRIAGE_INTERVAL_MINUTES` | `60` | How often to re-assess news sentiment |
 | `SCHEDULE_INTERVAL_MINUTES` | `15` | How often to run the quant cycle |
 
