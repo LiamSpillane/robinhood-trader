@@ -1,8 +1,8 @@
 import asyncio
 import json
 import logging
-import signal
 from math import floor
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -267,9 +267,11 @@ async def run_quant_cycle(cache: TriageCache) -> None:
 
 
 def run_scheduler() -> None:
+    asyncio.run(_run_scheduler())
+
+
+async def _run_scheduler() -> None:
     settings = get_settings()
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
 
     scheduler = AsyncIOScheduler()
 
@@ -280,6 +282,7 @@ def run_scheduler() -> None:
         id="triage",
         max_instances=1,
         coalesce=True,
+        next_run_time=datetime.now(),
     )
 
     scheduler.add_job(
@@ -289,6 +292,7 @@ def run_scheduler() -> None:
         id="quant",
         max_instances=1,
         coalesce=True,
+        next_run_time=datetime.now() + timedelta(seconds=15),
     )
 
     scheduler.start()
@@ -298,15 +302,8 @@ def run_scheduler() -> None:
         settings.schedule_interval_minutes,
     )
 
-    def _shutdown(sig_name: str) -> None:
-        log.info("Received %s - shutting down.", sig_name)
-        scheduler.shutdown(wait=False)
-        loop.stop()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _shutdown, sig.name)
-
     try:
-        loop.run_forever()
+        await asyncio.Event().wait()
     finally:
-        loop.close()
+        scheduler.shutdown(wait=False)
+        log.info("Scheduler stopped.")
